@@ -136,9 +136,7 @@ const QRScanner: React.FC<QRScannerProps> = ({ onQRCodeDetected, isLoading = fal
                         onScan={handleScan}
                         onError={handleError}
                         constraints={{
-                          echoCancellation: true,
-                          noiseSuppression: true,
-                          autoGainControl: true,
+                          aspectRatio: 1,
                           backgroundBlur: true, // Enable background blur for better focus
                           frameRate: { ideal: 30, max: 60 },
                           facingMode: 'environment', // Use back camera on mobile
@@ -148,11 +146,6 @@ const QRScanner: React.FC<QRScannerProps> = ({ onQRCodeDetected, isLoading = fal
                           container: {
                             width: '100%',
                             height: '100%',
-                          },
-                          video: {
-                            width: '100%',
-                            height: '100%',
-                            objectFit: 'cover',
                           },
                         }}
                       />
