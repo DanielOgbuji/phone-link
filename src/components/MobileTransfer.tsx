@@ -1,0 +1,737 @@
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import {
+  Box,
+  Button,
+  Text,
+  VStack,
+  HStack,
+  Container,
+  Heading,
+  Progress,
+  Card,
+  Spinner,
+  Flex,
+  Input,
+  Badge,
+  Center,
+  Tabs,
+  useBreakpointValue,
+} from '@chakra-ui/react';
+import { validateCode, getTransferSessionStatus, type ValidateCodeResponse, type TransferSessionStatus } from '../api/transfer';
+import { toaster } from './ui/toaster';
+import CodeInput from './CodeInput';
+import QRScanner from './QRScanner';
+
+type TransferState = 'input' | 'validating' | 'connected' | 'file-selection' | 'transferring' | 'completed' | 'error';
+
+interface FileWithPreview {
+  file: File;
+  preview?: string;
+}
+
+const MobileTransfer: React.FC = () => {
+  const [transferState, setTransferState] = useState<TransferState>('input');
+  const [selectedFile, setSelectedFile] = useState<FileWithPreview | null>(null);
+  const [transferProgress, setTransferProgress] = useState(0);
+  const [error, setError] = useState<string>('');
+  const [bearerToken, setBearerToken] = useState<string>('');
+  const [transferCode, setTransferCode] = useState<string>('');
+  const [sessionId, setSessionId] = useState<string>('');
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const pollingIntervalRef = useRef<number | null>(null);
+
+  // Responsive values for different screen sizes
+  const containerMaxW = useBreakpointValue({ base: "sm" as const, md: "md" as const, lg: "lg" as const });
+  const headingSize = useBreakpointValue({ base: "md" as const, md: "lg" as const });
+  const buttonSize = useBreakpointValue({ base: "md" as const, md: "lg" as const });
+  const spacing = useBreakpointValue({ base: 4, md: 6 });
+  const cardMaxW = useBreakpointValue({ base: "100%", md: "400px" });
+
+  // Additional responsive values for use in render functions
+  const previewImageSize = useBreakpointValue({ base: "50px" as const, md: "60px" as const });
+  const statusIconSize = useBreakpointValue({ base: "12px" as const, md: "16px" as const });
+  const spinnerSize = useBreakpointValue({ base: "lg" as const, md: "xl" as const });
+  const tabSize = useBreakpointValue({ base: "md" as const, md: "lg" as const });
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
+  const handleCodeSubmit = useCallback(async (code: string, token?: string) => {
+    setTransferState('validating');
+    setError('');
+    setTransferCode(code);
+
+    // If token is provided from QR scan, use it
+    if (token) {
+      setBearerToken(token);
+      console.log('Using token from QR code');
+    }
+
+    try {
+      // Skip HTTP validation and go directly to WebSocket like HTML file
+      await connectWithCode(code);
+
+    } catch (err) {
+      setTransferState('input');
+      const errorMessage = err instanceof Error ? err.message : 'Failed to validate code';
+      setError(errorMessage);
+
+      toaster.create({
+        title: 'Validation Failed',
+        description: errorMessage,
+        type: 'error',
+        duration: 5000,
+        closable: true,
+      });
+    }
+  }, [bearerToken]);
+
+  // Connect with code using direct WebSocket approach like HTML file
+  const connectWithCode = async (code: string) => {
+    const wsUrl = 'wss://healthdocx-node.onrender.com/ws/transfer';
+    const token = bearerToken || undefined;
+
+    // Add token to WebSocket URL if provided (like HTML file)
+    let urlToUse = wsUrl;
+    if (token) {
+      const sep = wsUrl.includes('?') ? '&' : '?';
+      urlToUse = `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+    }
+
+    const ws = new WebSocket(urlToUse);
+    wsRef.current = ws;
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Connection timeout'));
+        ws.close();
+      }, 10000);
+
+      ws.onopen = () => {
+        console.log('WebSocket connected, joining session...');
+
+        // Send join message like HTML file
+        const joinPayload: any = {
+          type: 'join_session',
+          code: code,
+          connectionType: 'mobile'
+        };
+
+        if (token) {
+          joinPayload.token = token;
+        }
+
+        ws.send(JSON.stringify(joinPayload));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          console.log('Received WebSocket message:', message);
+
+          switch (message.type) {
+            case 'session_joined':
+              clearTimeout(timeout);
+              setSessionId(message.sessionId); // Store sessionId like HTML file
+              setTransferState('connected');
+              toaster.create({
+                title: 'Connected!',
+                description: 'Ready to send files',
+                type: 'success',
+                duration: 3000,
+              });
+              resolve(message);
+              break;
+
+            case 'file_uploaded':
+              console.log('File uploaded successfully');
+              setTransferState('completed');
+              setTransferProgress(100);
+              toaster.create({
+                title: 'Transfer Complete',
+                description: 'File sent successfully!',
+                type: 'success',
+                duration: 5000,
+              });
+              break;
+
+            case 'upload_error':
+              console.log('Upload error:', message.message);
+              throw new Error(message.message || 'Upload failed');
+
+            case 'error':
+              console.log('WebSocket error:', message.message);
+              throw new Error(message.message || 'Connection failed');
+
+            default:
+              console.log('Unknown message type:', message.type, message);
+          }
+        } catch (err) {
+          clearTimeout(timeout);
+          console.error('WebSocket message error:', err);
+          setError(err instanceof Error ? err.message : 'Connection failed');
+          setTransferState('error');
+          reject(err);
+        }
+      };
+
+      ws.onerror = (error) => {
+        clearTimeout(timeout);
+        console.error('WebSocket error:', error);
+        setError('Connection failed');
+        setTransferState('error');
+        reject(new Error('Connection failed'));
+      };
+
+      ws.onclose = (event) => {
+        clearTimeout(timeout);
+        console.log('WebSocket closed:', event.code, event.reason);
+        if (transferState === 'validating') {
+          setError('Connection closed');
+          setTransferState('error');
+        }
+      };
+    });
+  };
+
+  const handleFileSelect = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Validate file size (max 100MB)
+    const maxSize = 100 * 1024 * 1024;
+    if (file.size > maxSize) {
+      toaster.create({
+        title: 'File Too Large',
+        description: 'Please select a file smaller than 100MB',
+        type: 'error',
+        duration: 5000,
+        closable: true,
+      });
+      return;
+    }
+
+    // Create preview for images
+    let preview: string | undefined;
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        preview = e.target?.result as string;
+        setSelectedFile({ file, preview });
+      };
+      reader.readAsDataURL(file);
+    } else {
+      setSelectedFile({ file });
+    }
+
+    setTransferState('file-selection');
+  }, []);
+
+  const handleCameraCapture = useCallback(() => {
+    // For now, use file input with camera capture
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.capture = 'environment';
+
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) {
+        handleFileChange({ target: { files: [file] } } as any);
+      }
+    };
+
+    input.click();
+  }, [handleFileChange]);
+
+  const startFileTransfer = useCallback(async () => {
+    if (!selectedFile || !wsRef.current || !sessionId) {
+      setError('No file selected or connection not established');
+      return;
+    }
+
+    setTransferState('transferring');
+    setTransferProgress(0);
+
+    try {
+      // Use existing WebSocket connection like HTML file
+      const ws = wsRef.current;
+
+      // Set up message handling for file transfer confirmation
+      const originalOnMessage = ws.onmessage;
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          console.log('File transfer message:', message);
+
+          switch (message.type) {
+            case 'file_uploaded':
+              console.log('File uploaded successfully');
+              setTransferState('completed');
+              setTransferProgress(100);
+              toaster.create({
+                title: 'Transfer Complete',
+                description: 'File sent successfully!',
+                type: 'success',
+                duration: 5000,
+              });
+              // Restore original message handler
+              ws.onmessage = originalOnMessage;
+              break;
+
+            case 'upload_error':
+              console.log('Upload error:', message.message);
+              setError(message.message || 'Upload failed');
+              setTransferState('error');
+              ws.onmessage = originalOnMessage;
+              break;
+
+            case 'error':
+              console.log('WebSocket error:', message.message);
+              setError(message.message || 'Transfer failed');
+              setTransferState('error');
+              ws.onmessage = originalOnMessage;
+              break;
+
+            default:
+              // Handle other messages with original handler if it exists
+              if (originalOnMessage) {
+                originalOnMessage.call(ws, event);
+              } else {
+                console.log('Unknown message type during transfer:', message.type, message);
+              }
+          }
+        } catch (err) {
+          console.error('WebSocket message error during transfer:', err);
+          setError(err instanceof Error ? err.message : 'Transfer failed');
+          setTransferState('error');
+          // Restore original message handler
+          ws.onmessage = originalOnMessage;
+        }
+      };
+
+      // Send file using existing connection (like HTML file does)
+      await sendFileDirect(ws, selectedFile.file);
+
+      // Set a timeout in case server doesn't respond
+      setTimeout(() => {
+        if (transferState === 'transferring') {
+          console.log('File transfer timeout');
+          setError('Transfer timeout - please try again');
+          setTransferState('error');
+          // Restore original message handler
+          ws.onmessage = originalOnMessage;
+        }
+      }, 30000); // 30 second timeout
+
+    } catch (err) {
+      console.error('Transfer error:', err);
+      setError('Failed to start transfer');
+      setTransferState('error');
+    }
+  }, [selectedFile, sessionId, transferState]);
+
+  // Convert file to base64 (from HTML file logic)
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        if (reader.result && typeof reader.result === 'string') {
+          // Remove data:image/jpeg;base64, prefix to get just base64 data
+          const base64 = reader.result.split(',')[1];
+          resolve(base64);
+        } else {
+          reject(new Error('Failed to convert file to base64'));
+        }
+      };
+      reader.onerror = error => reject(error);
+    });
+  };
+
+  // Send file using HTML file's approach - single send, not chunked
+  const sendFileDirect = async (ws: WebSocket, file: File) => {
+    try {
+      // Generate unique file ID like HTML file
+      const fileId = `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+      // Convert file to base64 like HTML file does
+      const base64Data = await fileToBase64(file);
+
+      console.log(`Sending file ${file.name} (${file.size} bytes, ${base64Data.length} base64 chars)`);
+
+      // Show 50% progress while processing
+      setTransferProgress(50);
+
+      // Send entire file at once (like HTML file)
+      const message = {
+        type: 'file_upload',
+        sessionId: sessionId, // Include sessionId like HTML file
+        fileId: fileId,
+        filename: file.name,
+        mimeType: file.type,
+        fileData: base64Data,
+        fileSize: file.size
+      };
+
+      ws.send(JSON.stringify(message));
+
+      // Show 100% after sending
+      setTransferProgress(100);
+
+    } catch (error) {
+      console.error('Error sending file:', error);
+      setError('Failed to send file');
+      setTransferState('error');
+    }
+  };
+
+  const resetTransfer = useCallback(() => {
+    setTransferState('input');
+    setSelectedFile(null);
+    setTransferProgress(0);
+    setError('');
+    setTransferCode('');
+    setSessionId('');
+
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  }, []);
+
+  // Send another file - keep connection active, just reset file state
+  const sendAnotherFile = useCallback(() => {
+    setTransferState('connected');
+    setSelectedFile(null);
+    setTransferProgress(0);
+    setError('');
+  }, []);
+
+  const renderInputState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto" colorPalette="brand">
+      <VStack gap={3}>
+        <Heading size={headingSize} textAlign="center" color="primary">
+          Send Files to Desktop
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          Enter the 6-digit code or scan the QR code from your desktop
+        </Text>
+      </VStack>
+
+      {/* Bearer Token Input */}
+      <Box w="full">
+        <VStack gap={3}>
+          <Text fontSize="sm" fontWeight="medium" textAlign="center">
+            Bearer Token (Optional)
+          </Text>
+          <Input
+            type="password"
+            value={bearerToken}
+            onChange={(e) => setBearerToken(e.target.value)}
+            placeholder="Enter your bearer token"
+            size={buttonSize}
+          />
+          <Text fontSize="xs" textAlign="center">
+            Leave empty if no authentication is required
+          </Text>
+        </VStack>
+      </Box>
+
+      {/* Tabs for Code Entry and QR Scanning */}
+      <Box w="full">
+        <Tabs.Root defaultValue="manual" variant="line" size={tabSize}>
+          <Tabs.List>
+            <Tabs.Trigger value="manual" flex="1">
+              Manual Entry
+            </Tabs.Trigger>
+            <Tabs.Trigger value="qr" flex="1">
+              QR Scanner
+            </Tabs.Trigger>
+          </Tabs.List>
+
+          <Tabs.Content value="manual" p={6}>
+            <VStack gap={4}>
+              <Text fontSize="sm" textAlign="center">
+                Enter the 6-digit code shown on your desktop
+              </Text>
+              <CodeInput
+                onCodeSubmit={handleCodeSubmit}
+                isLoading={transferState === 'validating'}
+              />
+            </VStack>
+          </Tabs.Content>
+
+          <Tabs.Content value="qr" p={6}>
+            <VStack gap={4}>
+              <Text fontSize="sm" textAlign="center">
+                Scan the QR code displayed on your desktop
+              </Text>
+              <Box
+                w="full"
+                display="flex"
+                alignItems="center"
+                justifyContent="center"
+              >
+                <QRScanner
+                  onQRCodeDetected={handleCodeSubmit}
+                  isLoading={transferState === 'validating'}
+                />
+              </Box>
+            </VStack>
+          </Tabs.Content>
+        </Tabs.Root>
+      </Box>
+
+      {error && (
+        <Box p={4} borderRadius="md">
+          <Text fontSize="sm" textAlign="center">
+            {error}
+          </Text>
+        </Box>
+      )}
+    </VStack>
+  );
+
+  const renderConnectedState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+      <VStack gap={3}>
+        <Box w={statusIconSize} h={statusIconSize} borderRadius="full" bg="green.400" />
+        <Heading size={headingSize} textAlign="center">
+          Connected Successfully!
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          Choose how you'd like to send your file
+        </Text>
+      </VStack>
+
+      <VStack gap={4} w="full">
+        <Button
+          size={buttonSize}
+          w="full"
+          onClick={handleFileSelect}
+        >
+          Choose File
+        </Button>
+
+        <Button
+          size={buttonSize}
+          w="full"
+          onClick={handleCameraCapture}
+        >
+          Take Photo
+        </Button>
+      </VStack>
+
+      <Box>
+        <label htmlFor="file-input" style={{ display: 'none' }}>
+          Choose file to upload
+        </label>
+        <input
+          id="file-input"
+          ref={fileInputRef}
+          type="file"
+          accept="image/*,application/pdf,.doc,.docx,.txt"
+          onChange={handleFileChange}
+          style={{ display: 'none' }}
+        />
+      </Box>
+    </VStack>
+  );
+
+  const renderFileSelectionState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+      <VStack gap={3}>
+        <Heading size={headingSize} textAlign="center">
+          File Selected
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          Ready to send your file
+        </Text>
+      </VStack>
+
+      {selectedFile && (
+        <Card.Root w="full" maxW={{ base: "100%", md: "350px" }}>
+          <Card.Body>
+            <HStack gap={3}>
+              <Box>
+                {selectedFile.preview ? (
+                  <img
+                    src={selectedFile.preview}
+                    alt={selectedFile.file.name}
+                    style={{
+                      width: previewImageSize,
+                      height: previewImageSize,
+                      objectFit: 'cover',
+                      borderRadius: '8px'
+                    }}
+                  />
+                ) : (
+                  <Box
+                    w={previewImageSize}
+                    h={previewImageSize}
+                    borderRadius="8px"
+                    display="flex"
+                    alignItems="center"
+                    justifyContent="center"
+                  />
+                )}
+              </Box>
+              <VStack gap={1} align="start" flex="1" minW="0">
+                <Text fontWeight="medium" fontSize="sm" truncate>
+                  {selectedFile.file.name}
+                </Text>
+                <Text fontSize="xs">
+                  {(selectedFile.file.size / 1024 / 1024).toFixed(1)} MB
+                </Text>
+              </VStack>
+            </HStack>
+          </Card.Body>
+        </Card.Root>
+      )}
+
+      <VStack gap={4} w="full">
+        <Button
+          size={buttonSize}
+          w="full"
+          onClick={startFileTransfer}
+        >
+          Send File
+        </Button>
+
+        <Button
+          variant="outline"
+          size={buttonSize}
+          w="full"
+          onClick={() => setTransferState('connected')}
+        >
+          Choose Different File
+        </Button>
+      </VStack>
+    </VStack>
+  );
+
+  const renderTransferringState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+      <VStack gap={3}>
+        <Spinner size={spinnerSize} />
+        <Heading size={headingSize} textAlign="center">
+          Sending File
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          Please wait while your file is being transferred...
+        </Text>
+      </VStack>
+
+      <Box w="full">
+        <Progress.Root value={transferProgress} size={buttonSize} w="full">
+          <Progress.Track>
+            <Progress.Range />
+          </Progress.Track>
+        </Progress.Root>
+        <Text fontSize="sm" textAlign="center" mt={2}>
+          {Math.round(transferProgress)}% complete
+        </Text>
+      </Box>
+
+      <Button
+        variant="outline"
+        size={buttonSize}
+        onClick={resetTransfer}
+      >
+        Cancel Transfer
+      </Button>
+    </VStack>
+  );
+
+  const renderCompletedState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+      <VStack gap={3}>
+        <Box w={statusIconSize} h={statusIconSize} borderRadius="full" bg="green.400" />
+        <Heading size={headingSize} textAlign="center">
+          Transfer Complete!
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          Your file has been sent successfully
+        </Text>
+      </VStack>
+
+      <VStack gap={4} w="full">
+        <Button
+          size={buttonSize}
+          w="full"
+          onClick={sendAnotherFile}
+        >
+          Send Another File
+        </Button>
+      </VStack>
+    </VStack>
+  );
+
+  const renderErrorState = () => (
+    <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+      <VStack gap={3}>
+        <Box w={statusIconSize} h={statusIconSize} borderRadius="full" bg="red.400" />
+        <Heading size={headingSize} textAlign="center">
+          Transfer Failed
+        </Heading>
+        <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>
+          {error || 'Something went wrong'}
+        </Text>
+      </VStack>
+
+      <VStack gap={4} w="full">
+        <Button
+          size={buttonSize}
+          w="full"
+          onClick={resetTransfer}
+        >
+          Try Again
+        </Button>
+      </VStack>
+    </VStack>
+  );
+
+  return (
+    <Container maxW={containerMaxW} py={{ base: 4, md: 8 }}>
+      <Flex minH="100vh" align="center" justify="center">
+        <Box w="full" maxW="100%">
+          {transferState === 'input' && renderInputState()}
+          {transferState === 'validating' && (
+            <VStack gap={6} w="full" maxW={cardMaxW} mx="auto">
+              <Spinner size={spinnerSize} />
+              <Text textAlign="center" fontSize={{ base: "sm", md: "md" }}>Validating code...</Text>
+            </VStack>
+          )}
+          {transferState === 'connected' && renderConnectedState()}
+          {transferState === 'file-selection' && renderFileSelectionState()}
+          {transferState === 'transferring' && renderTransferringState()}
+          {transferState === 'completed' && renderCompletedState()}
+          {transferState === 'error' && renderErrorState()}
+        </Box>
+      </Flex>
+    </Container>
+  );
+};
+
+export default MobileTransfer;
