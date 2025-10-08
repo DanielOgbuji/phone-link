@@ -141,6 +141,8 @@ const QRScanner: React.FC<QRScannerProps> = ({ onQRCodeDetected, isLoading = fal
                           frameRate: { ideal: 30, max: 60 },
                           sampleRate: { ideal: 44100, max: 96000 },
                           sampleSize: 20,
+                          displaySurface: 'monitor',
+                          deviceId: undefined, // Let the browser choose the default camera
                           facingMode: 'environment', // Use back camera on mobile
                         }}
                         formats={['qr_code', 'micro_qr_code', 'rm_qr_code']} // Only scan QR codes
