@@ -12,7 +12,6 @@ import {
   Spinner,
   Flex,
   Input,
-  Badge,
   Center,
   Tabs,
   useBreakpointValue,
@@ -31,6 +30,9 @@ interface FileWithPreview {
 
 const MobileTransfer: React.FC = () => {
   const [transferState, setTransferState] = useState<TransferState>('input');
+  const transferStateRef = useRef<TransferState>(transferState);
+  useEffect(() => { transferStateRef.current = transferState; }, [transferState]);
+
   const [selectedFile, setSelectedFile] = useState<FileWithPreview | null>(null);
   const [transferProgress, setTransferProgress] = useState(0);
   const [error, setError] = useState<string>('');
@@ -41,6 +43,8 @@ const MobileTransfer: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pollingIntervalRef = useRef<number | null>(null);
+  const connectionTimeoutRef = useRef<number | null>(null);
+  const transferTimeoutRef = useRef<number | null>(null);
 
   // Responsive values for different screen sizes
   const containerMaxW = useBreakpointValue({ base: "sm" as const, md: "md" as const, lg: "lg" as const });
@@ -61,8 +65,14 @@ const MobileTransfer: React.FC = () => {
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
       }
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+      }
+      if (transferTimeoutRef.current) {
+        clearTimeout(transferTimeoutRef.current);
+      }
       if (wsRef.current) {
-        wsRef.current.close();
+        try { wsRef.current.close(); } catch (e) { /* ignore */ }
       }
     };
   }, []);
@@ -112,14 +122,20 @@ const MobileTransfer: React.FC = () => {
     const ws = new WebSocket(urlToUse);
     wsRef.current = ws;
 
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+    return new Promise<any>((resolve, reject) => {
+      // Connection timeout to guard against hanging attempts.
+      connectionTimeoutRef.current = window.setTimeout(() => {
         reject(new Error('Connection timeout'));
-        ws.close();
+        try { ws.close(); } catch (e) { /* ignore */ }
       }, 10000);
 
       ws.onopen = () => {
-        console.log('WebSocket connected, joining session...');
+        console.log('WebSocket opened');
+        // Clear the connection timeout on open (server may take time to respond; don't kill socket prematurely)
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
 
         // Send join message like HTML file
         const joinPayload: any = {
@@ -132,17 +148,25 @@ const MobileTransfer: React.FC = () => {
           joinPayload.token = token;
         }
 
-        ws.send(JSON.stringify(joinPayload));
+        try {
+          ws.send(JSON.stringify(joinPayload));
+        } catch (e) {
+          // failed to send join
+          console.error('Failed to send join message', e);
+        }
       };
 
-      ws.onmessage = (event) => {
+      const onMessage = (event: MessageEvent) => {
         try {
           const message = JSON.parse(event.data);
           console.log('Received WebSocket message:', message);
 
           switch (message.type) {
             case 'session_joined':
-              clearTimeout(timeout);
+              if (connectionTimeoutRef.current) {
+                clearTimeout(connectionTimeoutRef.current);
+                connectionTimeoutRef.current = null;
+              }
               setSessionId(message.sessionId); // Store sessionId like HTML file
               setTransferState('connected');
               toaster.create({
@@ -151,6 +175,7 @@ const MobileTransfer: React.FC = () => {
                 type: 'success',
                 duration: 3000,
               });
+              // keep this listener (it can handle other global messages), but resolve the connect promise
               resolve(message);
               break;
 
@@ -168,36 +193,51 @@ const MobileTransfer: React.FC = () => {
 
             case 'upload_error':
               console.log('Upload error:', message.message);
-              throw new Error(message.message || 'Upload failed');
+              // do not throw — handle gracefully
+              setError(message.message || 'Upload failed');
+              setTransferState('error');
+              // don't reject the original promise here (it may already be resolved)
+              break;
 
             case 'error':
               console.log('WebSocket error:', message.message);
-              throw new Error(message.message || 'Connection failed');
+              setError(message.message || 'Connection failed');
+              setTransferState('error');
+              break;
 
             default:
               console.log('Unknown message type:', message.type, message);
           }
         } catch (err) {
-          clearTimeout(timeout);
           console.error('WebSocket message error:', err);
           setError(err instanceof Error ? err.message : 'Connection failed');
           setTransferState('error');
+          // If connection handshake hasn't resolved yet, reject
           reject(err);
         }
       };
 
-      ws.onerror = (error) => {
-        clearTimeout(timeout);
-        console.error('WebSocket error:', error);
+      ws.addEventListener('message', onMessage);
+
+      ws.onerror = (errorEvent) => {
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        console.error('WebSocket error:', errorEvent);
         setError('Connection failed');
         setTransferState('error');
         reject(new Error('Connection failed'));
       };
 
       ws.onclose = (event) => {
-        clearTimeout(timeout);
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
         console.log('WebSocket closed:', event.code, event.reason);
-        if (transferState === 'validating') {
+        // use ref to check current state
+        if (transferStateRef.current === 'validating') {
           setError('Connection closed');
           setTransferState('error');
         }
@@ -209,8 +249,8 @@ const MobileTransfer: React.FC = () => {
     fileInputRef.current?.click();
   }, []);
 
-  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  // central handler that accepts a File and processes validation + preview, then sets state
+  const handleFileProcessing = useCallback(async (file: File) => {
     if (!file) return;
 
     // Validate file size (max 100MB)
@@ -226,38 +266,53 @@ const MobileTransfer: React.FC = () => {
       return;
     }
 
-    // Create preview for images
-    let preview: string | undefined;
+    // If image, create preview first, then set state
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        preview = e.target?.result as string;
+        const preview = e.target?.result as string | undefined;
         setSelectedFile({ file, preview });
+        setTransferState('file-selection');
+      };
+      reader.onerror = () => {
+        // If preview fails, still set file without preview
+        setSelectedFile({ file });
+        setTransferState('file-selection');
       };
       reader.readAsDataURL(file);
     } else {
+      // non-image: set immediately
       setSelectedFile({ file });
+      setTransferState('file-selection');
     }
-
-    setTransferState('file-selection');
   }, []);
+
+  // keep original signature for input onChange — just delegate into handleFileProcessing
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // store file immediately to avoid browser clearing references during async ops
+    handleFileProcessing(file);
+  }, [handleFileProcessing]);
 
   const handleCameraCapture = useCallback(() => {
     // For now, use file input with camera capture
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*';
-    input.capture = 'environment';
+    // note: 'capture' may or may not behave consistently across browsers
+    (input as any).capture = 'environment';
 
     input.onchange = (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (file) {
-        handleFileChange({ target: { files: [file] } } as any);
+        // don't fake an event; process the File directly
+        handleFileProcessing(file);
       }
     };
 
     input.click();
-  }, [handleFileChange]);
+  }, [handleFileProcessing]);
 
   const startFileTransfer = useCallback(async () => {
     if (!selectedFile || !wsRef.current || !sessionId) {
@@ -265,16 +320,20 @@ const MobileTransfer: React.FC = () => {
       return;
     }
 
+    // Check socket ready state
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setError('Connection lost. Please reconnect.');
+      setTransferState('error');
+      return;
+    }
+
     setTransferState('transferring');
     setTransferProgress(0);
 
     try {
-      // Use existing WebSocket connection like HTML file
-      const ws = wsRef.current;
-
-      // Set up message handling for file transfer confirmation
-      const originalOnMessage = ws.onmessage;
-      ws.onmessage = (event) => {
+      // Attach a temporary listener for transfer-specific messages
+      const transferMessageHandler = (event: MessageEvent) => {
         try {
           const message = JSON.parse(event.data);
           console.log('File transfer message:', message);
@@ -290,52 +349,69 @@ const MobileTransfer: React.FC = () => {
                 type: 'success',
                 duration: 5000,
               });
-              // Restore original message handler
-              ws.onmessage = originalOnMessage;
+              // remove this handler
+              ws.removeEventListener('message', transferMessageHandler);
+              // clear transfer timeout
+              if (transferTimeoutRef.current) {
+                clearTimeout(transferTimeoutRef.current);
+                transferTimeoutRef.current = null;
+              }
               break;
 
             case 'upload_error':
               console.log('Upload error:', message.message);
               setError(message.message || 'Upload failed');
               setTransferState('error');
-              ws.onmessage = originalOnMessage;
+              ws.removeEventListener('message', transferMessageHandler);
+              if (transferTimeoutRef.current) {
+                clearTimeout(transferTimeoutRef.current);
+                transferTimeoutRef.current = null;
+              }
               break;
 
             case 'error':
               console.log('WebSocket error:', message.message);
               setError(message.message || 'Transfer failed');
               setTransferState('error');
-              ws.onmessage = originalOnMessage;
+              ws.removeEventListener('message', transferMessageHandler);
+              if (transferTimeoutRef.current) {
+                clearTimeout(transferTimeoutRef.current);
+                transferTimeoutRef.current = null;
+              }
               break;
 
             default:
-              // Handle other messages with original handler if it exists
-              if (originalOnMessage) {
-                originalOnMessage.call(ws, event);
-              } else {
-                console.log('Unknown message type during transfer:', message.type, message);
-              }
+              // let global handler deal with it
+              break;
           }
         } catch (err) {
           console.error('WebSocket message error during transfer:', err);
           setError(err instanceof Error ? err.message : 'Transfer failed');
           setTransferState('error');
-          // Restore original message handler
-          ws.onmessage = originalOnMessage;
+          ws.removeEventListener('message', transferMessageHandler);
+          if (transferTimeoutRef.current) {
+            clearTimeout(transferTimeoutRef.current);
+            transferTimeoutRef.current = null;
+          }
         }
       };
+
+      ws.addEventListener('message', transferMessageHandler);
 
       // Send file using existing connection (like HTML file does)
       await sendFileDirect(ws, selectedFile.file);
 
       // Set a timeout in case server doesn't respond
-      setTimeout(() => {
-        if (transferState === 'transferring') {
+      transferTimeoutRef.current = window.setTimeout(() => {
+        if (transferStateRef.current === 'transferring') {
           console.log('File transfer timeout');
           setError('Transfer timeout - please try again');
           setTransferState('error');
-          // Restore original message handler
-          ws.onmessage = originalOnMessage;
+          try { ws.removeEventListener('message', transferMessageHandler); } catch (e) { /* ignore */ }
+          if (transferTimeoutRef.current) {
+            clearTimeout(transferTimeoutRef.current);
+            transferTimeoutRef.current = null;
+          }
         }
       }, 30000); // 30 second timeout
 
@@ -344,7 +420,7 @@ const MobileTransfer: React.FC = () => {
       setError('Failed to start transfer');
       setTransferState('error');
     }
-  }, [selectedFile, sessionId, transferState]);
+  }, [selectedFile, sessionId]);
 
   // Convert file to base64 (from HTML file logic)
   const fileToBase64 = (file: File): Promise<string> => {
@@ -353,8 +429,9 @@ const MobileTransfer: React.FC = () => {
       reader.readAsDataURL(file);
       reader.onload = () => {
         if (reader.result && typeof reader.result === 'string') {
-          // Remove data:image/jpeg;base64, prefix to get just base64 data
-          const base64 = reader.result.split(',')[1];
+          // Remove data:...base64, prefix to get just base64 data
+          const parts = reader.result.split(',');
+          const base64 = parts.length > 1 ? parts[1] : parts[0];
           resolve(base64);
         } else {
           reject(new Error('Failed to convert file to base64'));
@@ -367,6 +444,11 @@ const MobileTransfer: React.FC = () => {
   // Send file using HTML file's approach - single send, not chunked
   const sendFileDirect = async (ws: WebSocket, file: File) => {
     try {
+      // Ensure socket is open right before sending
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new Error('WebSocket is not open');
+      }
+
       // Generate unique file ID like HTML file
       const fileId = `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
@@ -389,7 +471,11 @@ const MobileTransfer: React.FC = () => {
         fileSize: file.size
       };
 
-      ws.send(JSON.stringify(message));
+      try {
+        ws.send(JSON.stringify(message));
+      } catch (e) {
+        throw e;
+      }
 
       // Show 100% after sending
       setTransferProgress(100);
@@ -398,6 +484,7 @@ const MobileTransfer: React.FC = () => {
       console.error('Error sending file:', error);
       setError('Failed to send file');
       setTransferState('error');
+      throw error;
     }
   };
 
@@ -414,8 +501,18 @@ const MobileTransfer: React.FC = () => {
       pollingIntervalRef.current = null;
     }
 
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current);
+      connectionTimeoutRef.current = null;
+    }
+
+    if (transferTimeoutRef.current) {
+      clearTimeout(transferTimeoutRef.current);
+      transferTimeoutRef.current = null;
+    }
+
     if (wsRef.current) {
-      wsRef.current.close();
+      try { wsRef.current.close(); } catch (e) { /* ignore */ }
       wsRef.current = null;
     }
   }, []);
