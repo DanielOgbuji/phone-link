@@ -61,7 +61,20 @@ const MobileTransfer: React.FC = () => {
 
   // Cleanup on unmount
   useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        // check if the websocket is closed and if we are in a state that needs a connection
+        if (wsRef.current && wsRef.current.readyState === WebSocket.CLOSED && (transferStateRef.current === 'connected' || transferStateRef.current === 'file-selection')) {
+          console.log('Reconnecting WebSocket...');
+          connectWithCode(transferCode);
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
       }
@@ -75,7 +88,7 @@ const MobileTransfer: React.FC = () => {
         try { wsRef.current.close(); } catch (e) { /* ignore */ }
       }
     };
-  }, []);
+  }, [transferCode]);
 
   const handleCodeSubmit = useCallback(async (code: string, token?: string) => {
     setTransferState('validating');
@@ -127,7 +140,7 @@ const MobileTransfer: React.FC = () => {
       connectionTimeoutRef.current = window.setTimeout(() => {
         reject(new Error('Connection timeout'));
         try { ws.close(); } catch (e) { /* ignore */ }
-      }, 10000);
+      }, 20000);
 
       ws.onopen = () => {
         console.log('WebSocket opened');
@@ -413,7 +426,7 @@ const MobileTransfer: React.FC = () => {
             transferTimeoutRef.current = null;
           }
         }
-      }, 30000); // 30 second timeout
+      }, 60000); // 60 second timeout
 
     } catch (err) {
       console.error('Transfer error:', err);
@@ -740,16 +753,7 @@ const MobileTransfer: React.FC = () => {
         </Text>
       </VStack>
 
-      <Box w="full">
-        <Progress.Root value={transferProgress} size={buttonSize} w="full">
-          <Progress.Track>
-            <Progress.Range />
-          </Progress.Track>
-        </Progress.Root>
-        <Text fontSize="sm" textAlign="center" mt={2}>
-          {Math.round(transferProgress)}% complete
-        </Text>
-      </Box>
+      <Box w="full" />
 
       <Button
         variant="outline"
