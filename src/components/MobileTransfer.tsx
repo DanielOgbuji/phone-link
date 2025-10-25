@@ -307,7 +307,7 @@ const MobileTransfer: React.FC = () => {
     handleFileProcessing(file);
   }, [handleFileProcessing]);
 
-  const handleCameraCapture = useCallback(() => {
+  /* const handleCameraCapture = useCallback(() => {
     // For now, use file input with camera capture
     const input = document.createElement('input');
     input.type = 'file';
@@ -324,7 +324,7 @@ const MobileTransfer: React.FC = () => {
     };
 
     input.click();
-  }, [handleFileProcessing]);
+  }, [handleFileProcessing]); */
 
   const startFileTransfer = useCallback(async () => {
     if (!selectedFile || !wsRef.current || !sessionId) {
@@ -680,14 +680,6 @@ const MobileTransfer: React.FC = () => {
           onClick={handleFileSelect}
         >
           Choose File
-        </Button>
-
-        <Button
-          size={buttonSize}
-          w="full"
-          onClick={handleCameraCapture}
-        >
-          Take Photo
         </Button>
       </VStack>
 
