@@ -122,140 +122,139 @@ const MobileTransfer: React.FC = () => {
 
   // Connect with code using direct WebSocket approach like HTML file
   const connectWithCode = async (code: string) => {
-    const wsUrl = 'wss://healthdocx-node.onrender.com/ws/transfer';
-    const token = bearerToken || undefined;
+    return retryWithBackoff(async () => {
+      const wsUrl = 'wss://healthdocx-node.onrender.com/ws/transfer';
+      const token = bearerToken || undefined;
 
-    // Add token to WebSocket URL if provided (like HTML file)
-    let urlToUse = wsUrl;
-    if (token) {
-      const sep = wsUrl.includes('?') ? '&' : '?';
-      urlToUse = `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
-    }
+      // Add token to WebSocket URL if provided (like HTML file)
+      let urlToUse = wsUrl;
+      if (token) {
+        const sep = wsUrl.includes('?') ? '&' : '?';
+        urlToUse = `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+      }
 
-    const ws = new WebSocket(urlToUse);
-    wsRef.current = ws;
+      const ws = new WebSocket(urlToUse);
+      wsRef.current = ws;
 
-    return new Promise<any>((resolve, reject) => {
-      // Connection timeout to guard against hanging attempts.
-      connectionTimeoutRef.current = window.setTimeout(() => {
-        reject(new Error('Connection timeout'));
-        try { ws.close(); } catch (e) { /* ignore */ }
-      }, 20000);
+      return new Promise<any>((resolve, reject) => {
+        // Connection timeout to guard against hanging attempts.
+        connectionTimeoutRef.current = window.setTimeout(() => {
+          reject(new Error('Connection timeout'));
+          try { ws.close(); } catch (e) { /* ignore */ }
+        }, 20000);
 
-      ws.onopen = () => {
-        console.log('WebSocket opened');
-        // Clear the connection timeout on open (server may take time to respond; don't kill socket prematurely)
-        if (connectionTimeoutRef.current) {
-          clearTimeout(connectionTimeoutRef.current);
-          connectionTimeoutRef.current = null;
-        }
+        ws.onopen = () => {
+          console.log('WebSocket opened');
+          // Clear the connection timeout on open (server may take time to respond; don't kill socket prematurely)
+          if (connectionTimeoutRef.current) {
+            clearTimeout(connectionTimeoutRef.current);
+            connectionTimeoutRef.current = null;
+          }
 
-        // Send join message like HTML file
-        const joinPayload: any = {
-          type: 'join_session',
-          code: code,
-          connectionType: 'mobile'
+          // Send join message like HTML file
+          const joinPayload: any = {
+            type: 'join_session',
+            code: code,
+            connectionType: 'mobile'
+          };
+
+          if (token) {
+            joinPayload.token = token;
+          }
+
+          try {
+            ws.send(JSON.stringify(joinPayload));
+          } catch (e) {
+            // failed to send join
+            console.error('Failed to send join message', e);
+          }
         };
 
-        if (token) {
-          joinPayload.token = token;
-        }
+        const onMessage = (event: MessageEvent) => {
+          try {
+            const message = JSON.parse(event.data);
+            console.log('Received WebSocket message:', message);
 
-        try {
-          ws.send(JSON.stringify(joinPayload));
-        } catch (e) {
-          // failed to send join
-          console.error('Failed to send join message', e);
-        }
-      };
+            switch (message.type) {
+              case 'session_joined':
+                if (connectionTimeoutRef.current) {
+                  clearTimeout(connectionTimeoutRef.current);
+                  connectionTimeoutRef.current = null;
+                }
+                setSessionId(message.sessionId); // Store sessionId like HTML file
+                setTransferState('connected');
+                toaster.create({
+                  title: 'Connected!',
+                  description: 'Ready to send files',
+                  type: 'success',
+                  duration: 3000,
+                });
+                // keep this listener (it can handle other global messages), but resolve the connect promise
+                resolve(message);
+                break;
 
-      const onMessage = (event: MessageEvent) => {
-        try {
-          const message = JSON.parse(event.data);
-          console.log('Received WebSocket message:', message);
+              case 'file_uploaded':
+                console.log('File uploaded successfully');
+                setTransferState('completed');
+                setTransferProgress(100);
+                toaster.create({
+                  title: 'Transfer Complete',
+                  description: 'File sent successfully!',
+                  type: 'success',
+                  duration: 5000,
+                });
+                break;
 
-          switch (message.type) {
-            case 'session_joined':
-              if (connectionTimeoutRef.current) {
-                clearTimeout(connectionTimeoutRef.current);
-                connectionTimeoutRef.current = null;
-              }
-              setSessionId(message.sessionId); // Store sessionId like HTML file
-              setTransferState('connected');
-              toaster.create({
-                title: 'Connected!',
-                description: 'Ready to send files',
-                type: 'success',
-                duration: 3000,
-              });
-              // keep this listener (it can handle other global messages), but resolve the connect promise
-              resolve(message);
-              break;
+              case 'upload_error':
+                console.log('Upload error:', message.message);
+                // do not throw — handle gracefully
+                setError(message.message || 'Upload failed');
+                setTransferState('error');
+                // don't reject the original promise here (it may already be resolved)
+                break;
 
-            case 'file_uploaded':
-              console.log('File uploaded successfully');
-              setTransferState('completed');
-              setTransferProgress(100);
-              toaster.create({
-                title: 'Transfer Complete',
-                description: 'File sent successfully!',
-                type: 'success',
-                duration: 5000,
-              });
-              break;
+              case 'error':
+                console.log('WebSocket error:', message.message);
+                setError(message.message || 'Connection failed');
+                setTransferState('error');
+                break;
 
-            case 'upload_error':
-              console.log('Upload error:', message.message);
-              // do not throw — handle gracefully
-              setError(message.message || 'Upload failed');
-              setTransferState('error');
-              // don't reject the original promise here (it may already be resolved)
-              break;
-
-            case 'error':
-              console.log('WebSocket error:', message.message);
-              setError(message.message || 'Connection failed');
-              setTransferState('error');
-              break;
-
-            default:
-              console.log('Unknown message type:', message.type, message);
+              default:
+                console.log('Unknown message type:', message.type, message);
+            }
+          } catch (err) {
+            console.error('WebSocket message error:', err);
+            setError(err instanceof Error ? err.message : 'Connection failed');
+            setTransferState('error');
+            // If connection handshake hasn't resolved yet, reject
+            reject(err);
           }
-        } catch (err) {
-          console.error('WebSocket message error:', err);
-          setError(err instanceof Error ? err.message : 'Connection failed');
-          setTransferState('error');
-          // If connection handshake hasn't resolved yet, reject
-          reject(err);
-        }
-      };
+        };
 
-      ws.addEventListener('message', onMessage);
+        ws.addEventListener('message', onMessage);
 
-      ws.onerror = (errorEvent) => {
-        if (connectionTimeoutRef.current) {
-          clearTimeout(connectionTimeoutRef.current);
-          connectionTimeoutRef.current = null;
-        }
-        console.error('WebSocket error:', errorEvent);
-        setError('Connection failed');
-        setTransferState('error');
-        reject(new Error('Connection failed'));
-      };
+        ws.onerror = (errorEvent) => {
+          if (connectionTimeoutRef.current) {
+            clearTimeout(connectionTimeoutRef.current);
+            connectionTimeoutRef.current = null;
+          }
+          console.error('WebSocket error:', errorEvent);
+          reject(new Error('Connection failed'));
+        };
 
-      ws.onclose = (event) => {
-        if (connectionTimeoutRef.current) {
-          clearTimeout(connectionTimeoutRef.current);
-          connectionTimeoutRef.current = null;
-        }
-        console.log('WebSocket closed:', event.code, event.reason);
-        // use ref to check current state
-        if (transferStateRef.current === 'validating') {
-          setError('Connection closed');
-          setTransferState('error');
-        }
-      };
-    });
+        ws.onclose = (event) => {
+          if (connectionTimeoutRef.current) {
+            clearTimeout(connectionTimeoutRef.current);
+            connectionTimeoutRef.current = null;
+          }
+          console.log('WebSocket closed:', event.code, event.reason);
+          // use ref to check current state
+          if (transferStateRef.current === 'validating') {
+            reject(new Error('Connection closed'));
+          }
+        };
+      });
+    }, 3, 1000); // 3 retries with 1 second initial delay
   };
 
   const handleFileSelect = useCallback(() => {
@@ -330,6 +329,7 @@ const MobileTransfer: React.FC = () => {
   const startFileTransfer = useCallback(async () => {
     if (!selectedFile || !wsRef.current || !sessionId) {
       setError('No file selected or connection not established');
+      setTransferState('error');
       return;
     }
 
@@ -344,94 +344,113 @@ const MobileTransfer: React.FC = () => {
     setTransferState('transferring');
     setTransferProgress(0);
 
+    // Wrap the entire transfer process with retry logic
     try {
-      // Attach a temporary listener for transfer-specific messages
-      const transferMessageHandler = (event: MessageEvent) => {
-        try {
-          const message = JSON.parse(event.data);
-          console.log('File transfer message:', message);
+      await retryWithBackoff(async () => {
+        return new Promise<void>((resolve, reject) => {
+          // Attach a temporary listener for transfer-specific messages
+          const transferMessageHandler = (event: MessageEvent) => {
+            try {
+              const message = JSON.parse(event.data);
+              console.log('File transfer message:', message);
 
-          switch (message.type) {
-            case 'file_uploaded':
-              console.log('File uploaded successfully');
-              setTransferState('completed');
-              setTransferProgress(100);
-              toaster.create({
-                title: 'Transfer Complete',
-                description: 'File sent successfully!',
-                type: 'success',
-                duration: 5000,
-              });
-              // remove this handler
+              switch (message.type) {
+                case 'file_uploaded':
+                  console.log('File uploaded successfully');
+                  setTransferState('completed');
+                  setTransferProgress(100);
+                  toaster.create({
+                    title: 'Transfer Complete',
+                    description: 'File sent successfully!',
+                    type: 'success',
+                    duration: 5000,
+                  });
+                  // remove this handler
+                  ws.removeEventListener('message', transferMessageHandler);
+                  // clear transfer timeout
+                  if (transferTimeoutRef.current) {
+                    clearTimeout(transferTimeoutRef.current);
+                    transferTimeoutRef.current = null;
+                  }
+                  resolve(); // Resolve on success
+                  break;
+
+                case 'upload_error':
+                  console.log('Upload error:', message.message);
+                  // Remove handler and reject so retry can happen
+                  ws.removeEventListener('message', transferMessageHandler);
+                  if (transferTimeoutRef.current) {
+                    clearTimeout(transferTimeoutRef.current);
+                    transferTimeoutRef.current = null;
+                  }
+                  reject(new Error(message.message || 'Upload failed'));
+                  break;
+
+                case 'error':
+                  console.log('WebSocket error:', message.message);
+                  // Remove handler and reject so retry can happen
+                  ws.removeEventListener('message', transferMessageHandler);
+                  if (transferTimeoutRef.current) {
+                    clearTimeout(transferTimeoutRef.current);
+                    transferTimeoutRef.current = null;
+                  }
+                  reject(new Error(message.message || 'Transfer failed'));
+                  break;
+
+                default:
+                  // let global handler deal with it
+                  break;
+              }
+            } catch (err) {
+              console.error('WebSocket message error during transfer:', err);
               ws.removeEventListener('message', transferMessageHandler);
-              // clear transfer timeout
               if (transferTimeoutRef.current) {
                 clearTimeout(transferTimeoutRef.current);
                 transferTimeoutRef.current = null;
               }
-              break;
+              reject(err);
+            }
+          };
 
-            case 'upload_error':
-              console.log('Upload error:', message.message);
-              setError(message.message || 'Upload failed');
-              setTransferState('error');
-              ws.removeEventListener('message', transferMessageHandler);
-              if (transferTimeoutRef.current) {
-                clearTimeout(transferTimeoutRef.current);
-                transferTimeoutRef.current = null;
-              }
-              break;
+          ws.addEventListener('message', transferMessageHandler);
 
-            case 'error':
-              console.log('WebSocket error:', message.message);
-              setError(message.message || 'Transfer failed');
-              setTransferState('error');
-              ws.removeEventListener('message', transferMessageHandler);
-              if (transferTimeoutRef.current) {
-                clearTimeout(transferTimeoutRef.current);
-                transferTimeoutRef.current = null;
-              }
-              break;
+          // Send file using existing connection (like HTML file does)
+          sendFileDirect(ws, selectedFile.file).catch((sendError) => {
+            // Handle WebSocket send failures
+            console.error('Send file error:', sendError);
+            ws.removeEventListener('message', transferMessageHandler);
+            if (transferTimeoutRef.current) {
+              clearTimeout(transferTimeoutRef.current);
+              transferTimeoutRef.current = null;
+            }
+            reject(sendError);
+          });
 
-            default:
-              // let global handler deal with it
-              break;
-          }
-        } catch (err) {
-          console.error('WebSocket message error during transfer:', err);
-          setError(err instanceof Error ? err.message : 'Transfer failed');
-          setTransferState('error');
-          ws.removeEventListener('message', transferMessageHandler);
-          if (transferTimeoutRef.current) {
-            clearTimeout(transferTimeoutRef.current);
-            transferTimeoutRef.current = null;
-          }
-        }
-      };
-
-      ws.addEventListener('message', transferMessageHandler);
-
-      // Send file using existing connection (like HTML file does)
-      await sendFileDirect(ws, selectedFile.file);
-
-      // Set a timeout in case server doesn't respond
-      transferTimeoutRef.current = window.setTimeout(() => {
-        if (transferStateRef.current === 'transferring') {
-          console.log('File transfer timeout');
-          setError('Transfer timeout - please try again');
-          setTransferState('error');
-          try { ws.removeEventListener('message', transferMessageHandler); } catch (e) { /* ignore */ }
-          if (transferTimeoutRef.current) {
-            clearTimeout(transferTimeoutRef.current);
-            transferTimeoutRef.current = null;
-          }
-        }
-      }, 60000); // 60 second timeout
+          // Set a timeout in case server doesn't respond
+          transferTimeoutRef.current = window.setTimeout(() => {
+            console.log('File transfer timeout');
+            ws.removeEventListener('message', transferMessageHandler);
+            if (transferTimeoutRef.current) {
+              clearTimeout(transferTimeoutRef.current);
+              transferTimeoutRef.current = null;
+            }
+            reject(new Error('Transfer timeout'));
+          }, 60000); // 60 second timeout
+        });
+      }, 3, 1000); // 3 retries with 1 second initial delay
 
     } catch (err) {
-      console.error('Transfer error:', err);
-      setError('Failed to start transfer');
+      console.error('Transfer error after retries:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Failed to send file';
+      setError(errorMessage);
       setTransferState('error');
+      toaster.create({
+        title: 'Transfer Failed',
+        description: errorMessage,
+        type: 'error',
+        duration: 5000,
+        closable: true,
+      });
     }
   }, [selectedFile, sessionId]);
 
@@ -456,49 +475,41 @@ const MobileTransfer: React.FC = () => {
 
   // Send file using HTML file's approach - single send, not chunked
   const sendFileDirect = async (ws: WebSocket, file: File) => {
-    try {
-      // Ensure socket is open right before sending
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        throw new Error('WebSocket is not open');
-      }
-
-      // Generate unique file ID like HTML file
-      const fileId = `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-      // Convert file to base64 like HTML file does
-      const base64Data = await fileToBase64(file);
-
-      console.log(`Sending file ${file.name} (${file.size} bytes, ${base64Data.length} base64 chars)`);
-
-      // Show 50% progress while processing
-      setTransferProgress(50);
-
-      // Send entire file at once (like HTML file)
-      const message = {
-        type: 'file_upload',
-        sessionId: sessionId, // Include sessionId like HTML file
-        fileId: fileId,
-        filename: file.name,
-        mimeType: file.type,
-        fileData: base64Data,
-        fileSize: file.size
-      };
-
-      try {
-        ws.send(JSON.stringify(message));
-      } catch (e) {
-        throw e;
-      }
-
-      // Show 100% after sending
-      setTransferProgress(100);
-
-    } catch (error) {
-      console.error('Error sending file:', error);
-      setError('Failed to send file');
-      setTransferState('error');
-      throw error;
+    // Ensure socket is open right before sending
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not open');
     }
+
+    // Generate unique file ID like HTML file
+    const fileId = `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Convert file to base64 like HTML file does
+    const base64Data = await fileToBase64(file);
+
+    console.log(`Sending file ${file.name} (${file.size} bytes, ${base64Data.length} base64 chars)`);
+
+    // Show 50% progress while processing
+    setTransferProgress(50);
+
+    // Send entire file at once (like HTML file)
+    const message = {
+      type: 'file_upload',
+      sessionId: sessionId, // Include sessionId like HTML file
+      fileId: fileId,
+      filename: file.name,
+      mimeType: file.type,
+      fileData: base64Data,
+      fileSize: file.size
+    };
+
+    try {
+      ws.send(JSON.stringify(message));
+    } catch (e) {
+      throw e;
+    }
+
+    // Show 100% after sending
+    setTransferProgress(100);
   };
 
   const resetTransfer = useCallback(() => {
@@ -537,6 +548,33 @@ const MobileTransfer: React.FC = () => {
     setTransferProgress(0);
     setError('');
   }, []);
+
+  // Utility function for retry with exponential backoff
+  const retryWithBackoff = async <T,>(
+    fn: () => Promise<T>,
+    maxRetries: number = 3,
+    initialDelay: number = 1000
+  ): Promise<T> => {
+    let attempt = 0;
+
+    while (attempt < maxRetries) {
+      try {
+        console.log(`Attempting operation (attempt ${attempt + 1}/${maxRetries})`);
+        return await fn();
+      } catch (error) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          throw error;
+        }
+
+        const delay = initialDelay * Math.pow(2, attempt - 1);
+        console.log(`Operation failed, retrying in ${delay}ms...`, error);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    throw new Error('All retry attempts failed');
+  };
 
   const renderInputState = () => (
     <VStack gap={6} w="full" maxW={cardMaxW} mx="auto" colorPalette="brand">
