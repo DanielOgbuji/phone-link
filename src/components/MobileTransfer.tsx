@@ -46,6 +46,14 @@ const MobileTransfer: React.FC = () => {
   const connectionTimeoutRef = useRef<number | null>(null);
   const transferTimeoutRef = useRef<number | null>(null);
 
+  // New refs for connection stability
+  const heartbeatIntervalRef = useRef<number | null>(null);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const maxReconnectAttempts = 5;
+  const heartbeatInterval = 30000; // 30 seconds
+  const reconnectDelay = 2000; // 2 seconds base delay
+
   // Responsive values for different screen sizes
   const containerMaxW = useBreakpointValue({ base: "sm" as const, md: "md" as const, lg: "lg" as const });
   const headingSize = useBreakpointValue({ base: "md" as const, md: "lg" as const });
@@ -58,6 +66,137 @@ const MobileTransfer: React.FC = () => {
   const statusIconSize = useBreakpointValue({ base: "12px" as const, md: "16px" as const });
   const spinnerSize = useBreakpointValue({ base: "lg" as const, md: "xl" as const });
   const tabSize = useBreakpointValue({ base: "md" as const, md: "lg" as const });
+
+  // Start heartbeat to keep connection alive
+  const startHeartbeat = useCallback(() => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+    }
+
+    heartbeatIntervalRef.current = window.setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+          console.log('Heartbeat sent');
+        } catch (error) {
+          console.error('Failed to send heartbeat:', error);
+          // If heartbeat fails, the connection might be dead, trigger reconnection
+          handleConnectionLoss();
+        }
+      }
+    }, heartbeatInterval);
+  }, []);
+
+  // Stop heartbeat
+  const stopHeartbeat = useCallback(() => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+  }, []);
+
+  // Handle connection loss and attempt reconnection
+  const handleConnectionLoss = useCallback(() => {
+    console.log('Connection lost, attempting to reconnect...');
+    stopHeartbeat();
+
+    // Only attempt reconnection if we're in a state that needs connection
+    const currentState = transferStateRef.current;
+    if (currentState === 'connected' || currentState === 'file-selection' || currentState === 'transferring') {
+      if (reconnectAttemptsRef.current < maxReconnectAttempts) {
+        reconnectAttemptsRef.current += 1;
+        const delay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current - 1);
+
+        console.log(`Reconnection attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${delay}ms`);
+
+        reconnectTimeoutRef.current = window.setTimeout(() => {
+          connectWithCode(transferCode).then(() => {
+            console.log('Reconnected successfully');
+            reconnectAttemptsRef.current = 0; // Reset on success
+            startHeartbeat(); // Restart heartbeat
+          }).catch((error) => {
+            console.error('Reconnection failed:', error);
+            if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
+              setError('Connection lost. Please refresh and try again.');
+              setTransferState('error');
+            } else {
+              handleConnectionLoss(); // Try again
+            }
+          });
+        }, delay);
+      } else {
+        setError('Connection lost after multiple attempts. Please refresh and try again.');
+        setTransferState('error');
+      }
+    }
+  }, [transferCode, startHeartbeat, stopHeartbeat]);
+
+  // Enhanced WebSocket message handler with pong response
+  const createWebSocketMessageHandler = useCallback((resolve?: (value: any) => void, reject?: (reason?: any) => void) => {
+    return (event: MessageEvent) => {
+      try {
+        const message = JSON.parse(event.data);
+        console.log('Received WebSocket message:', message);
+
+        switch (message.type) {
+          case 'pong':
+            // Heartbeat response - connection is alive
+            console.log('Received pong - connection alive');
+            break;
+
+          case 'session_joined':
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            setSessionId(message.sessionId);
+            setTransferState('connected');
+            startHeartbeat(); // Start heartbeat after successful connection
+            toaster.create({
+              title: 'Connected!',
+              description: 'Ready to send files',
+              type: 'success',
+              duration: 3000,
+            });
+            if (resolve) resolve(message);
+            break;
+
+          case 'file_uploaded':
+            console.log('File uploaded successfully');
+            setTransferState('completed');
+            setTransferProgress(100);
+            toaster.create({
+              title: 'Transfer Complete',
+              description: 'File sent successfully!',
+              type: 'success',
+              duration: 5000,
+            });
+            break;
+
+          case 'upload_error':
+            console.log('Upload error:', message.message);
+            setError(message.message || 'Upload failed');
+            setTransferState('error');
+            break;
+
+          case 'error':
+            console.log('WebSocket error:', message.message);
+            setError(message.message || 'Connection failed');
+            setTransferState('error');
+            if (reject) reject(new Error(message.message || 'Connection failed'));
+            break;
+
+          default:
+            console.log('Unknown message type:', message.type, message);
+        }
+      } catch (err) {
+        console.error('WebSocket message error:', err);
+        setError(err instanceof Error ? err.message : 'Connection failed');
+        setTransferState('error');
+        if (reject) reject(err);
+      }
+    };
+  }, [startHeartbeat]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -84,11 +223,15 @@ const MobileTransfer: React.FC = () => {
       if (transferTimeoutRef.current) {
         clearTimeout(transferTimeoutRef.current);
       }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      stopHeartbeat(); // Stop heartbeat on unmount
       if (wsRef.current) {
         try { wsRef.current.close(); } catch (e) { /* ignore */ }
       }
     };
-  }, [transferCode]);
+  }, [transferCode, stopHeartbeat]);
 
   const handleCodeSubmit = useCallback(async (code: string, token?: string) => {
     setTransferState('validating');
@@ -170,68 +313,9 @@ const MobileTransfer: React.FC = () => {
           }
         };
 
-        const onMessage = (event: MessageEvent) => {
-          try {
-            const message = JSON.parse(event.data);
-            console.log('Received WebSocket message:', message);
-
-            switch (message.type) {
-              case 'session_joined':
-                if (connectionTimeoutRef.current) {
-                  clearTimeout(connectionTimeoutRef.current);
-                  connectionTimeoutRef.current = null;
-                }
-                setSessionId(message.sessionId); // Store sessionId like HTML file
-                setTransferState('connected');
-                toaster.create({
-                  title: 'Connected!',
-                  description: 'Ready to send files',
-                  type: 'success',
-                  duration: 3000,
-                });
-                // keep this listener (it can handle other global messages), but resolve the connect promise
-                resolve(message);
-                break;
-
-              case 'file_uploaded':
-                console.log('File uploaded successfully');
-                setTransferState('completed');
-                setTransferProgress(100);
-                toaster.create({
-                  title: 'Transfer Complete',
-                  description: 'File sent successfully!',
-                  type: 'success',
-                  duration: 5000,
-                });
-                break;
-
-              case 'upload_error':
-                console.log('Upload error:', message.message);
-                // do not throw — handle gracefully
-                setError(message.message || 'Upload failed');
-                setTransferState('error');
-                // don't reject the original promise here (it may already be resolved)
-                break;
-
-              case 'error':
-                console.log('WebSocket error:', message.message);
-                setError(message.message || 'Connection failed');
-                setTransferState('error');
-                break;
-
-              default:
-                console.log('Unknown message type:', message.type, message);
-            }
-          } catch (err) {
-            console.error('WebSocket message error:', err);
-            setError(err instanceof Error ? err.message : 'Connection failed');
-            setTransferState('error');
-            // If connection handshake hasn't resolved yet, reject
-            reject(err);
-          }
-        };
-
-        ws.addEventListener('message', onMessage);
+        // Use the enhanced message handler
+        const messageHandler = createWebSocketMessageHandler(resolve, reject);
+        ws.addEventListener('message', messageHandler);
 
         ws.onerror = (errorEvent) => {
           if (connectionTimeoutRef.current) {

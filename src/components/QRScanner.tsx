@@ -20,6 +20,7 @@ interface QRScannerProps {
 
 const QRScanner: React.FC<QRScannerProps> = ({ onQRCodeDetected, isLoading = false }) => {
   const [error, setError] = useState<string>('');
+  const [permissionStatus, setPermissionStatus] = useState<'unknown' | 'granted' | 'denied' | 'prompt'>('unknown');
   const { open, onOpen, onClose } = useDisclosure();
 
   const handleScan = (detectedCodes: any[]) => {
@@ -69,17 +70,64 @@ const QRScanner: React.FC<QRScannerProps> = ({ onQRCodeDetected, isLoading = fal
     }
   };
 
+  const checkCameraPermission = async () => {
+    try {
+      // Check if the browser supports camera permissions
+      if (navigator.permissions && navigator.permissions.query) {
+        const permission = await navigator.permissions.query({ name: 'camera' as PermissionName });
+        setPermissionStatus(permission.state);
+
+        if (permission.state === 'denied') {
+          setError('Camera permission denied. Please enable camera access in your browser settings.');
+          toaster.create({
+            title: 'Camera Permission Denied',
+            description: 'Please enable camera access in your browser settings and try again.',
+            type: 'error',
+            duration: 5000,
+            closable: true,
+          });
+          return false;
+        }
+      }
+      return true;
+    } catch (err) {
+      console.warn('Permission check not supported:', err);
+      return true; // Continue anyway on older browsers
+    }
+  };
+
+  const handleOpenScanner = async () => {
+    setError('');
+    const hasPermission = await checkCameraPermission();
+    if (hasPermission) {
+      onOpen();
+    }
+  };
+
   const handleError = (error: unknown) => {
     console.error('QR Scanner error:', error);
-    setError('Failed to access camera. Please check permissions.');
 
-    toaster.create({
-      title: 'Camera Error',
-      description: 'Unable to access camera. Please check permissions and try again.',
-      type: 'error',
-      duration: 5000,
-      closable: true,
-    });
+    // Check if it's a permission error
+    if (error instanceof Error && error.message.includes('permission')) {
+      setPermissionStatus('denied');
+      setError('Camera permission denied. Please enable camera access in your browser settings.');
+      toaster.create({
+        title: 'Camera Permission Denied',
+        description: 'Please enable camera access in your browser settings and try again.',
+        type: 'error',
+        duration: 5000,
+        closable: true,
+      });
+    } else {
+      setError('Failed to access camera. Please check permissions.');
+      toaster.create({
+        title: 'Camera Error',
+        description: 'Unable to access camera. Please check permissions and try again.',
+        type: 'error',
+        duration: 5000,
+        closable: true,
+      });
+    }
   };
 
 
